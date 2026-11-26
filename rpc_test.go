@@ -17,6 +17,7 @@ package libvirt
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -766,5 +767,187 @@ func TestDomainOpenConsoleBidirectionalStreamError(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("DomainOpenConsoleBidirectional did not return after a stream error")
 	}
+	<-serverDone
+}
+
+type failingWriter struct{ err error }
+
+func (w failingWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func TestDomainScreenshot(t *testing.T) {
+	l, srv := setupConsoleTest(t)
+
+	mimePayload, err := encode(OptString{"image/png"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk1 := []byte("\x89PNG\r\n\x1a\n")
+	chunk2 := []byte("rest-of-png")
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+
+		hdr, _, err := srv.readPacket()
+		if !assert.NoError(t, err) {
+			return
+		}
+		assert.Equal(t, uint32(socket.Call), hdr.Type)
+		assert.Equal(t, uint32(constants.ProcDomainScreenshot), hdr.Procedure)
+		serial, proc := hdr.Serial, hdr.Procedure
+
+		if !assert.NoError(t, srv.writePacket(serial, proc, socket.Reply, socket.StatusOK, mimePayload)) {
+			return
+		}
+		if !assert.NoError(t, srv.writePacket(serial, proc, socket.Stream, socket.StatusContinue, chunk1)) {
+			return
+		}
+		if !assert.NoError(t, srv.writePacket(serial, proc, socket.Stream, socket.StatusContinue, chunk2)) {
+			return
+		}
+		// Libvirtd signals EOF with an empty StatusContinue packet and expects
+		// the client's StatusOK finish packet before confirming with StatusOK.
+		if !assert.NoError(t, srv.writePacket(serial, proc, socket.Stream, socket.StatusContinue, nil)) {
+			return
+		}
+		fhdr, _, err := srv.readPacket()
+		if !assert.NoError(t, err) {
+			return
+		}
+		assert.Equal(t, uint32(socket.Stream), fhdr.Type)
+		assert.Equal(t, uint32(socket.StatusOK), fhdr.Status)
+		assert.Equal(t, serial, fhdr.Serial)
+
+		assert.NoError(t, srv.writePacket(serial, proc, socket.Stream, socket.StatusOK, nil))
+	}()
+
+	var got bytes.Buffer
+	type result struct {
+		mime OptString
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		mime, err := l.DomainScreenshot(Domain{}, &got, 0, 0)
+		done <- result{mime, err}
+	}()
+
+	select {
+	case res := <-done:
+		assert.NoError(t, res.err)
+		assert.Equal(t, OptString{"image/png"}, res.mime)
+		assert.Equal(t, append(chunk1, chunk2...), got.Bytes())
+	case <-time.After(2 * time.Second):
+		t.Fatal("DomainScreenshot did not return")
+	}
+	<-serverDone
+}
+
+func TestDomainScreenshotDirectStatusOK(t *testing.T) {
+	l, srv := setupConsoleTest(t)
+
+	mimePayload, err := encode(OptString{"image/png"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pngData := []byte("\x89PNG\r\n\x1a\ndata")
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+
+		hdr, _, err := srv.readPacket()
+		if !assert.NoError(t, err) {
+			return
+		}
+		serial, proc := hdr.Serial, hdr.Procedure
+		if !assert.NoError(t, srv.writePacket(serial, proc, socket.Reply, socket.StatusOK, mimePayload)) {
+			return
+		}
+		if !assert.NoError(t, srv.writePacket(serial, proc, socket.Stream, socket.StatusContinue, pngData)) {
+			return
+		}
+		assert.NoError(t, srv.writePacket(serial, proc, socket.Stream, socket.StatusOK, nil))
+	}()
+
+	var got bytes.Buffer
+	mime, err := l.DomainScreenshot(Domain{}, &got, 0, 0)
+	assert.NoError(t, err)
+	assert.Equal(t, OptString{"image/png"}, mime)
+	assert.Equal(t, pngData, got.Bytes())
+	<-serverDone
+}
+
+func TestDomainScreenshotWriteErrorAbortsStream(t *testing.T) {
+	l, srv := setupConsoleTest(t)
+
+	mimePayload, err := encode(OptString{"image/png"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeErr := errors.New("writer limit exceeded")
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+
+		hdr, _, err := srv.readPacket()
+		if !assert.NoError(t, err) {
+			return
+		}
+		serial, proc := hdr.Serial, hdr.Procedure
+		if !assert.NoError(t, srv.writePacket(serial, proc, socket.Reply, socket.StatusOK, mimePayload)) {
+			return
+		}
+		if !assert.NoError(t, srv.writePacket(serial, proc, socket.Stream, socket.StatusContinue, []byte("chunk1"))) {
+			return
+		}
+		// Simulate an in-flight chunk already sent before the server sees abort.
+		if !assert.NoError(t, srv.writePacket(serial, proc, socket.Stream, socket.StatusContinue, []byte("chunk2"))) {
+			return
+		}
+		ahdr, _, err := srv.readPacket()
+		if !assert.NoError(t, err) {
+			return
+		}
+		assert.Equal(t, uint32(socket.Stream), ahdr.Type)
+		assert.Equal(t, uint32(socket.StatusError), ahdr.Status)
+		assert.NoError(t, srv.writePacket(serial, proc, socket.Stream, socket.StatusOK, nil))
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := l.DomainScreenshot(Domain{}, failingWriter{err: writeErr}, 0, 0)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		assert.ErrorIs(t, err, writeErr)
+	case <-time.After(2 * time.Second):
+		t.Fatal("DomainScreenshot did not return after write error")
+	}
+	<-serverDone
+}
+
+func TestDomainScreenshotServerError(t *testing.T) {
+	l, srv := setupConsoleTest(t)
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+
+		hdr, _, err := srv.readPacket()
+		if !assert.NoError(t, err) {
+			return
+		}
+		assert.NoError(t, srv.writePacket(hdr.Serial, hdr.Procedure, socket.Reply, socket.StatusError, testErrorMessage))
+	}()
+
+	var got bytes.Buffer
+	_, err := l.DomainScreenshot(Domain{}, &got, 0, 0)
+	var le Error
+	assert.ErrorAs(t, err, &le)
+	assert.Equal(t, uint32(ErrOperationInvalid), le.Code)
 	<-serverDone
 }

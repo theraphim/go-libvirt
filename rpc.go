@@ -282,9 +282,9 @@ func (l *Libvirt) requestStream(proc uint32, program uint32, payload []byte,
 		return response{}, err
 	}
 
-	resp, err := l.getResponse(c)
+	reply, err := l.getResponse(c)
 	if err != nil {
-		return resp, err
+		return reply, err
 	}
 
 	if out != nil {
@@ -295,10 +295,10 @@ func (l *Libvirt) requestStream(proc uint32, program uint32, payload []byte,
 		}()
 
 		// Even without incoming stream server sends confirmation once all data is received
-		resp, err = l.processIncomingStream(c, in)
+		_, err = l.processIncomingStream(c, in)
 		if err != nil {
 			abort <- true
-			return resp, err
+			return response{}, err
 		}
 
 		if in == nil {
@@ -306,7 +306,7 @@ func (l *Libvirt) requestStream(proc uint32, program uint32, payload []byte,
 			if err != nil {
 				return response{}, err
 			}
-			return resp, nil
+			return reply, nil
 		}
 
 		// Bidirectional stream: the incoming half has ended, so the session is over
@@ -325,13 +325,59 @@ func (l *Libvirt) requestStream(proc uint32, program uint32, payload []byte,
 		default:
 		}
 
-		return resp, nil
+		return reply, nil
 	}
 
 	if in == nil {
-		return resp, nil
+		return reply, nil
 	}
-	return l.processIncomingStream(c, in)
+	if err := l.receiveStream(serial, proc, program, c, in); err != nil {
+		return response{}, err
+	}
+	return reply, nil
+}
+
+// receiveStream reads a read-only incoming stream into inStream, finishes the
+// stream handshake on EOF, or aborts it if writing to inStream fails.
+func (l *Libvirt) receiveStream(serial int32, proc, program uint32, c chan response, inStream io.Writer) error {
+	for {
+		resp, err := l.getResponse(c)
+		if err != nil {
+			return err
+		}
+		if resp.Status == socket.StatusOK {
+			return nil
+		}
+		// An empty StatusContinue packet marks server-side EOF; finish the
+		// stream so libvirtd releases server resources (e.g. screenshot temp files).
+		if len(resp.Payload) == 0 {
+			if err := l.socket.SendPacket(serial, proc, program, nil, socket.Stream, socket.StatusOK); err != nil {
+				return err
+			}
+			for {
+				resp, err := l.getResponse(c)
+				if err != nil {
+					return err
+				}
+				if resp.Status == socket.StatusOK {
+					return nil
+				}
+			}
+		}
+		if inStream != nil {
+			if _, writeErr := inStream.Write(resp.Payload); writeErr != nil {
+				if sendErr := l.socket.SendPacket(serial, proc, program, nil, socket.Stream, socket.StatusError); sendErr == nil {
+					for {
+						r, rerr := l.getResponse(c)
+						if rerr != nil || r.Status == socket.StatusOK {
+							break
+						}
+					}
+				}
+				return writeErr
+			}
+		}
+	}
 }
 
 // processIncomingStream is called once we've successfully sent a request to
